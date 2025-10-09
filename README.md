@@ -8,6 +8,11 @@ I was just sick of leaving Emacs for the uncomfortable world of some corporation
 
 ## Features
 
+- **Async-First Architecture** for responsive, non-blocking operations
+  - All API calls are asynchronous by default
+  - Progress reporting during long-running operations
+  - Emacs remains responsive while fetching issues
+  - Configurable async behavior with backward compatibility
 - List, view, and create Linear issues directly from Emacs
 - Bi-directional synchronization between Linear.app and org-mode
 - **Configurable state mapping** between Linear workflow states and org-mode TODO states
@@ -166,6 +171,25 @@ Optionally, set a default team ID to streamline issue creation:
 ```elisp
 (setq linear-emacs-default-team-id "your-team-id")
 ```
+
+### Async Configuration
+
+The package uses async-first architecture by default for better performance and responsiveness. You can customize this behavior:
+
+```elisp
+;; Enable/disable async API calls (default: t)
+(setq linear-emacs-async-default t)
+
+;; Enable/disable progress messages during operations (default: t)
+(setq linear-emacs-progress-messages t)
+```
+
+When `linear-emacs-progress-messages` is enabled, you'll see helpful progress indicators:
+- `[Linear] Fetching issues... (page 1)`
+- `[Linear] Retrieved 50 issues (fetching page 2)...`
+- `[Linear] Retrieved 150 issues (complete)`
+
+This keeps you informed during long-running operations without blocking your workflow.
 
 ### Customizing the Output Path
 
@@ -457,7 +481,37 @@ In the optimized configuration, these keybindings are already set up for you:
       :desc "Toggle Linear auto-sync" "t" #'my/toggle-linear-auto-sync)
 ```
 
-## Performance Optimization
+## Performance & Architecture
+
+### Async-First Design
+
+The package has been refactored with an async-first architecture that provides significant performance improvements:
+
+**Benefits:**
+- **Non-blocking operations**: Emacs remains fully responsive during API calls
+- **Progressive pagination**: Issues are fetched in batches with real-time progress updates
+- **Request tracking**: Active request counter prevents overwhelming the API
+- **Backward compatibility**: All existing synchronous functions still work via wrapper functions
+
+**How it works:**
+- All API calls use callbacks instead of blocking
+- Large issue lists are fetched progressively (100 issues per page)
+- Progress messages keep you informed: `[Linear] Retrieved 50 issues (fetching page 2)...`
+- Background synchronization doesn't interrupt your editing workflow
+
+**Example:**
+```elisp
+;; Async version (default)
+(linear-emacs-list-issues)  ; Returns immediately, updates when ready
+
+;; Progress messages appear:
+;; [Linear] Fetching issues...
+;; [Linear] Retrieved 50 issues (fetching page 2)...
+;; [Linear] Retrieved 150 issues (complete)
+;; Updated Linear issues in ~/org/gtd/linear.org with 150 active issues
+```
+
+### Synchronization Optimization
 
 To avoid synchronization performance issues, the optimized configuration:
 
