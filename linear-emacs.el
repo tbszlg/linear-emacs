@@ -34,7 +34,7 @@
 ;;
 ;; - Dependencies and requirements
 ;; - Customization and variables
-;; - Core API functions
+;; - Core API functions (async-first)
 ;; - Team management functions
 ;; - Issue management functions
 ;; - Issue state management functions
@@ -42,6 +42,7 @@
 ;; - Mapping functions (between Linear and org-mode)
 ;; - User-facing commands
 ;; - Org-mode sync hooks
+;; - Backward compatibility functions
 ;;
 
 ;; Dependencies
@@ -50,6 +51,7 @@
 (require 'dash)
 (require 's)
 (require 'org)
+(require 'cl-lib)
 
 ;;; Customization and Variables
 (defgroup linear-emacs nil
@@ -107,11 +109,23 @@ when running `linear-emacs-list-issues'."
   :type '(alist :key-type string :value-type string)
   :group 'linear-emacs)
 
+(defcustom linear-emacs-async-default t
+  "Use async API calls by default.
+When t, all API calls will be asynchronous unless explicitly overridden.
+Set to nil to use synchronous calls by default for backward compatibility."
+  :type 'boolean
+  :group 'linear-emacs)
+
+(defcustom linear-emacs-progress-messages t
+  "Show progress messages during long operations.
+When enabled, displays messages about ongoing API operations."
+  :type 'boolean
+  :group 'linear-emacs)
+
 (defvar linear-emacs-todo-states-pattern nil
   "Cached regex pattern for matching org-mode TODO states.
 This pattern is generated from `linear-emacs-issues-state-mapping'.
 Use `linear-emacs--get-todo-states-pattern' to get the pattern.")
-
 
 ;; Cache variables
 (defvar linear-emacs--cache-issues nil
@@ -120,7 +134,14 @@ Use `linear-emacs--get-todo-states-pattern' to get the pattern.")
 (defvar linear-emacs--cache-teams nil
   "Cache for teams.")
 
-;;; Core API Functions
+;; Progress tracking variables
+(defvar linear-emacs--active-requests 0
+  "Number of currently active API requests.")
+
+(defvar linear-emacs--request-queue nil
+  "Queue of pending requests to manage concurrent API calls.")
+
+;;; Core API Functions (Async-First Architecture)
 
 (defun linear-emacs--headers ()
   "Return headers for Linear API requests."
@@ -137,18 +158,36 @@ Use `linear-emacs--get-todo-states-pattern' to get the pattern.")
   (when linear-emacs-debug
     (apply #'message (concat "[Linear] " format-string) args)))
 
-(defun linear-emacs--graphql-request (query &optional variables)
-  "Make a GraphQL request to Linear API.
-  QUERY is the GraphQL query string.
-  VARIABLES is an optional alist of variables to include in the request.
-  Returns the JSON response data or nil if the request failed."
-  (linear-emacs--log "Making GraphQL request with query: %s" query)
+(defun linear-emacs--progress (format-string &rest args)
+  "Show progress message with FORMAT-STRING and ARGS if progress messages are enabled."
+  (when linear-emacs-progress-messages
+    (apply #'message (concat "[Linear] " format-string) args)))
+
+(defun linear-emacs--graphql-request-async (query &optional variables success-fn error-fn)
+  "Make an asynchronous GraphQL request to Linear API.
+QUERY is the GraphQL query string.
+VARIABLES is an optional alist of variables to include in the request.
+SUCCESS-FN is called with the response data on success.
+ERROR-FN is called with error information on failure.
+If SUCCESS-FN or ERROR-FN are not provided, default handlers will be used."
+  (linear-emacs--log "Making async GraphQL request with query: %s" query)
   (when variables
     (linear-emacs--log "Variables: %s" (prin1-to-string variables)))
 
-  (let ((response nil)
-        (error-response nil)
-        (request-data (json-encode `(("query" . ,query)
+  ;; Track active requests
+  (setq linear-emacs--active-requests (1+ linear-emacs--active-requests))
+
+  ;; Default handlers if not provided
+  (unless success-fn
+    (setq success-fn (lambda (data)
+                       (linear-emacs--log "Request completed: %s" (prin1-to-string data)))))
+
+  (unless error-fn
+    (setq error-fn (lambda (error-thrown response data)
+                     (message "Linear API error: %s" error-thrown)
+                     (linear-emacs--log "Error response: %s" (prin1-to-string data)))))
+
+  (let ((request-data (json-encode `(("query" . ,query)
                                      ,@(when variables `(("variables" . ,variables)))))))
     (linear-emacs--log "Request payload: %s" request-data)
 
@@ -158,18 +197,48 @@ Use `linear-emacs--get-todo-states-pattern' to get the pattern.")
       :headers (linear-emacs--headers)
       :data request-data
       :parser 'json-read
-      :sync t
       :success (cl-function
                 (lambda (&key data &allow-other-keys)
+                  (setq linear-emacs--active-requests (1- linear-emacs--active-requests))
                   (linear-emacs--log "Response received: %s" (prin1-to-string data))
-                  (setq response data)))
+                  (funcall success-fn data)))
       :error (cl-function
               (lambda (&key error-thrown response data &allow-other-keys)
-                (setq error-response error-thrown)
+                (setq linear-emacs--active-requests (1- linear-emacs--active-requests))
                 (linear-emacs--log "Error: %s" error-thrown)
                 (linear-emacs--log "Response status: %s" (request-response-status-code response))
                 (when data
-                  (linear-emacs--log "Error response: %s" (prin1-to-string data))))))
+                  (linear-emacs--log "Error response: %s" (prin1-to-string data)))
+                (funcall error-fn error-thrown response data))))))
+
+(defun linear-emacs--graphql-request (query &optional variables)
+  "Synchronous wrapper for GraphQL requests (backward compatibility).
+QUERY is the GraphQL query string.
+VARIABLES is an optional alist of variables.
+Returns the response data or nil on error.
+This function blocks until the request completes."
+  (linear-emacs--log "Making synchronous GraphQL request (backward compatibility mode)")
+  (let ((response nil)
+        (error-response nil)
+        (completed nil))
+
+    ;; Make async request but wait for completion
+    (linear-emacs--graphql-request-async
+     query
+     variables
+     (lambda (data)
+       (setq response data)
+       (setq completed t))
+     (lambda (error-thrown _response _data)
+       (setq error-response error-thrown)
+       (setq completed t)))
+
+    ;; Busy wait for completion (with timeout)
+    (let ((timeout 30) ; 30 second timeout
+          (start-time (current-time)))
+      (while (and (not completed)
+                  (< (float-time (time-subtract (current-time) start-time)) timeout))
+        (sleep-for 0.1)))
 
     (if error-response
         (progn
@@ -177,142 +246,96 @@ Use `linear-emacs--get-todo-states-pattern' to get the pattern.")
           nil)
       response)))
 
-;;; Team Management
+;;; Team Management (Async)
+
+(defun linear-emacs-get-teams-async (&optional callback)
+  "Asynchronously get a list of teams from Linear.
+CALLBACK is called with the list of teams on success."
+  (linear-emacs--log "Fetching teams asynchronously")
+  (linear-emacs--progress "Fetching teams...")
+
+  (let* ((query "query { teams { nodes { id name } } }")
+         (success-fn (lambda (response)
+                       (if response
+                           (let ((teams (cdr (assoc 'nodes (assoc 'teams (assoc 'data response))))))
+                             (linear-emacs--log "Retrieved %d teams" (length teams))
+                             (setq linear-emacs--cache-teams teams)
+                             (when callback
+                               (funcall callback teams)))
+                         (message "Failed to retrieve teams")
+                         (when callback
+                           (funcall callback nil)))))
+         (error-fn (lambda (_error _response _data)
+                     (message "Failed to retrieve teams")
+                     (when callback
+                       (funcall callback nil)))))
+
+    (linear-emacs--graphql-request-async query nil success-fn error-fn)))
 
 (defun linear-emacs-get-teams ()
-  "Get a list of teams from Linear."
-  (linear-emacs--log "Fetching teams")
-  (let* ((query "query { teams { nodes { id name } } }")
-         (response (linear-emacs--graphql-request query)))
-    (if response
-        (let ((teams (cdr (assoc 'nodes (assoc 'teams (assoc 'data response))))))
-          (linear-emacs--log "Retrieved %d teams" (length teams))
-          (setq linear-emacs--cache-teams teams)
-          teams)
-      (message "Failed to retrieve teams")
-      nil)))
+  "Get a list of teams from Linear (synchronous for backward compatibility)."
+  (let ((teams nil)
+        (completed nil))
+
+    (linear-emacs-get-teams-async
+     (lambda (result)
+       (setq teams result)
+       (setq completed t)))
+
+    ;; Wait for completion
+    (while (not completed)
+      (sleep-for 0.1))
+
+    teams))
+
+(defun linear-emacs-select-team-async (callback)
+  "Asynchronously prompt user to select a team.
+CALLBACK is called with the selected team."
+  (if linear-emacs--cache-teams
+      ;; Use cached teams
+      (let* ((team-names (mapcar (lambda (team)
+                                   (cons (cdr (assoc 'name team)) team))
+                                 linear-emacs--cache-teams))
+             (selected (completing-read "Select team: " team-names nil t)))
+        (funcall callback (cdr (assoc selected team-names))))
+    ;; Fetch teams first
+    (linear-emacs-get-teams-async
+     (lambda (teams)
+       (if teams
+           (let* ((team-names (mapcar (lambda (team)
+                                        (cons (cdr (assoc 'name team)) team))
+                                      teams))
+                  (selected (completing-read "Select team: " team-names nil t)))
+             (funcall callback (cdr (assoc selected team-names))))
+         (funcall callback nil))))))
 
 (defun linear-emacs-select-team ()
-  "Prompt user to select a team."
-  (let* ((teams (or linear-emacs--cache-teams (linear-emacs-get-teams)))
-         (team-names (when teams
-                       (mapcar (lambda (team)
-                                 (cons (cdr (assoc 'name team)) team))
-                               teams)))
-         (selected (completing-read "Select team: " team-names nil t)))
-    (cdr (assoc selected team-names))))
+  "Prompt user to select a team (synchronous for backward compatibility)."
+  (let ((result nil)
+        (completed nil))
 
-(defun linear-emacs--get-team-id-by-name (team-name)
-  "Get the Linear team ID for the given TEAM-NAME."
-  (linear-emacs--log "Looking up team ID for team %s" team-name)
-  (let* ((query "query {
-  teams {
-  nodes {
-  id
-  name
-  }
-  }
-  }")
-         (response (linear-emacs--graphql-request query))
-         (teams (and response
-                     (assoc 'data response)
-                     (assoc 'teams (assoc 'data response))
-                     (cdr (assoc 'nodes (assoc 'teams (assoc 'data response))))))
-         (team (and teams
-                    (seq-find (lambda (tm)
-                                (string= (cdr (assoc 'name tm)) team-name))
-                              teams))))
-    (if team
-        (cdr (assoc 'id team))
-      (progn
-        ;; If we couldn't find the team by exact name, cache the team IDs for debugging
-        (when teams
-          (linear-emacs--log "Available teams: %s"
-                             (mapconcat (lambda (tm)
-                                          (format "%s (%s)"
-                                                  (cdr (assoc 'name tm))
-                                                  (cdr (assoc 'id tm))))
-                                        teams
-                                        ", ")))
-        (message "Could not find team with name: %s" team-name)
-        nil))))
+    (linear-emacs-select-team-async
+     (lambda (team)
+       (setq result team)
+       (setq completed t)))
 
-(defun linear-emacs-get-team-members (team-id)
-  "Get members for the given TEAM-ID."
-  (linear-emacs--log "Fetching team members for team %s" team-id)
-  (let* ((query "query GetTeamMembers($teamId: String!) {
-  team(id: $teamId) {
-  members {
-  nodes {
-  id
-  name
-  displayName
-  }
-  }
-  }
-  }")
-         (variables `(("teamId" . ,team-id)))
-         (response (linear-emacs--graphql-request query variables)))
-    (when response
-      (let ((members (cdr (assoc 'nodes (assoc 'members (assoc 'team (assoc 'data response)))))))
-        (linear-emacs--log "Retrieved %d team members" (length members))
-        (let ((formatted-members
-               (mapcar (lambda (member)
-                         (cons (or (cdr (assoc 'displayName member))
-                                   (cdr (assoc 'name member)))
-                               (cdr (assoc 'id member))))
-                       members)))
-          (linear-emacs--log "Formatted team members: %s" (prin1-to-string formatted-members))
-          formatted-members)))))
+    ;; Wait for completion
+    (while (not completed)
+      (sleep-for 0.1))
 
-;;; Project Management
+    result))
 
-(defun linear-emacs-get-projects (team-id)
-  "Get a list of projects for the given TEAM-ID."
-  (linear-emacs--log "Fetching projects for team %s" team-id)
-  (let* ((query "query GetProjects($teamId: String!) {
-  team(id: $teamId) {
-    projects {
-      nodes {
-        id
-        name
-        description
-        state
-      }
-    }
-  }
-}")
-         (variables `(("teamId" . ,team-id)))
-         (response (linear-emacs--graphql-request query variables)))
-    (when response
-      (let ((projects (cdr (assoc 'nodes (assoc 'projects (assoc 'team (assoc 'data response)))))))
-        ;; Convert vector to list if needed
-        (when (vectorp projects)
-          (setq projects (append projects nil)))
-        (linear-emacs--log "Retrieved %d projects" (length projects))
-        projects))))
+;;; Issue Management (Async with Progress Reporting)
 
-(defun linear-emacs-select-project (team-id)
-  "Prompt user to select a project from TEAM-ID."
-  (let* ((projects (linear-emacs-get-projects team-id))
-         (project-names (when projects
-                          (mapcar (lambda (project)
-                                    (cons (cdr (assoc 'name project)) project))
-                                  projects)))
-         (selected (when project-names
-                     (completing-read "Select project (optional): " 
-                                      (cons "None" project-names) nil t nil nil "None"))))
-    (unless (string= selected "None")
-      (cdr (assoc selected project-names)))))
-
-;;; Issue Management
-
-(defun linear-emacs-get-issues-page (&optional after project-id)
-  "Get a page of issues assigned to the user starting AFTER the given cursor.
-Optionally filter by PROJECT-ID."
-  (linear-emacs--log "Fetching assigned issues page %s%s" 
+(defun linear-emacs-get-issues-page-async (callback &optional after project-id)
+  "Asynchronously get a page of issues.
+CALLBACK is called with a plist containing :issues, :has-next-page, and :end-cursor.
+AFTER is the cursor for pagination.
+PROJECT-ID optionally filters by project."
+  (linear-emacs--log "Fetching assigned issues page %s%s"
                      (if after (format "after %s" after) "first page")
                      (if project-id (format " for project %s" project-id) ""))
+
   (let* ((query (if project-id
                     "query GetAssignedIssues($first: Int!, $after: String, $projectId: ID!) {
   viewer {
@@ -373,89 +396,139 @@ Optionally filter by PROJECT-ID."
          (variables `(("first" . 100) ; Fetch 100 issues per page
                       ,@(when after `(("after" . ,after)))
                       ,@(when project-id `(("projectId" . ,project-id)))))
-         (response (linear-emacs--graphql-request query variables)))
-    (linear-emacs--log "Response: %s" (prin1-to-string response))
-    (if response
-        (if (assoc 'data response)
-            (let* ((viewer (assoc 'viewer (assoc 'data response)))
-                   (assigned-issues (and viewer (assoc 'assignedIssues viewer))))
-              (if assigned-issues
-                  (let* ((issues (cdr (assoc 'nodes assigned-issues)))
-                         (page-info (cdr (assoc 'pageInfo assigned-issues)))
-                         (has-next-page (and page-info (eq (cdr (assoc 'hasNextPage page-info)) t)))
-                         (end-cursor (and page-info (cdr (assoc 'endCursor page-info)))))
-                    (linear-emacs--log "Retrieved %d issues, has next page: %s, end cursor: %s"
-                                       (length issues) has-next-page end-cursor)
-                    (list :issues issues :has-next-page has-next-page :end-cursor end-cursor))
-                (progn
-                  (linear-emacs--log "No assignedIssues found in response")
-                  (list :issues nil :has-next-page nil :end-cursor nil))))
-          (progn
-            (linear-emacs--log "Invalid response format from Linear API: %s" (prin1-to-string response))
-            (message "Invalid response format from Linear API")
-            nil))
-      (progn
-        (message "Failed to retrieve issues")
-        nil))))
 
-(defun linear-emacs-get-issues (&optional project-id)
-  "Get a list of all issues assigned to the user with pagination.
-Optionally filter by PROJECT-ID."
-  (linear-emacs--log "Fetching all assigned issues with pagination%s"
+         (success-fn (lambda (response)
+                       (linear-emacs--log "Response: %s" (prin1-to-string response))
+                       (if (and response (assoc 'data response))
+                           (let* ((viewer (assoc 'viewer (assoc 'data response)))
+                                  (assigned-issues (and viewer (assoc 'assignedIssues viewer))))
+                             (if assigned-issues
+                                 (let* ((issues (cdr (assoc 'nodes assigned-issues)))
+                                        (page-info (cdr (assoc 'pageInfo assigned-issues)))
+                                        (has-next-page (and page-info (eq (cdr (assoc 'hasNextPage page-info)) t)))
+                                        (end-cursor (and page-info (cdr (assoc 'endCursor page-info)))))
+                                   (linear-emacs--log "Retrieved %d issues, has next page: %s"
+                                                      (length issues) has-next-page)
+                                   (funcall callback (list :issues issues
+                                                          :has-next-page has-next-page
+                                                          :end-cursor end-cursor)))
+                               (progn
+                                 (linear-emacs--log "No assignedIssues found in response")
+                                 (funcall callback (list :issues nil :has-next-page nil :end-cursor nil)))))
+                         (progn
+                           (linear-emacs--log "Invalid response format from Linear API")
+                           (message "Invalid response format from Linear API")
+                           (funcall callback nil)))))
+
+         (error-fn (lambda (_error _response _data)
+                     (message "Failed to retrieve issues")
+                     (funcall callback nil))))
+
+    (linear-emacs--graphql-request-async query variables success-fn error-fn)))
+
+(defun linear-emacs-get-issues-async (callback &optional project-id)
+  "Asynchronously get all issues with pagination and progress reporting.
+CALLBACK is called with the complete list of issues.
+PROJECT-ID optionally filters by project."
+  (linear-emacs--log "Fetching all assigned issues with async pagination%s"
                      (if project-id (format " for project %s" project-id) ""))
 
   (let ((all-issues '())
-        (has-more t)
-        (cursor nil)
         (page-num 1)
-        (max-pages 10)) ;; Safety limit to prevent infinite loops
+        (max-pages 10) ; Safety limit
+        (total-fetched 0))
 
-    ;; Loop through all pages
-    (while (and has-more (< page-num max-pages))
-      (linear-emacs--log "Fetching page %d of issues" page-num)
-      (let ((page-result (linear-emacs-get-issues-page cursor project-id)))
-        (if page-result
-            (let ((page-issues (plist-get page-result :issues))
-                  (next-has-more (plist-get page-result :has-next-page))
-                  (next-cursor (plist-get page-result :end-cursor)))
+    (linear-emacs--progress "Fetching issues... (page 1)")
 
-              ;; Only process if we have issues
-              (if page-issues
-                  (progn
-                    ;; Append issues from this page
-                    (when (vectorp page-issues)
-                      (setq page-issues (append page-issues nil)))
-                    (setq all-issues (append all-issues page-issues))
+    ;; Recursive function to fetch all pages
+    (cl-labels ((fetch-next-page (cursor)
+                  (if (>= page-num max-pages)
+                      (progn
+                        (linear-emacs--log "Reached maximum page limit (%d pages)" max-pages)
+                        (linear-emacs--progress "Retrieved %d issues (reached page limit)" total-fetched)
+                        (setq linear-emacs--cache-issues all-issues)
+                        (funcall callback all-issues))
 
-                    ;; Update pagination state
-                    (setq has-more next-has-more)
-                    (setq cursor next-cursor)
-                    (setq page-num (1+ page-num))
+                    (linear-emacs-get-issues-page-async
+                     (lambda (page-result)
+                       (if page-result
+                           (let ((page-issues (plist-get page-result :issues))
+                                 (has-more (plist-get page-result :has-next-page))
+                                 (next-cursor (plist-get page-result :end-cursor)))
 
-                    (linear-emacs--log "Retrieved %d issues from page %d, has more: %s"
-                                       (length page-issues) (1- page-num) has-more))
+                             (if page-issues
+                                 (progn
+                                   ;; Convert vector to list if needed
+                                   (when (vectorp page-issues)
+                                     (setq page-issues (append page-issues nil)))
 
-                ;; No issues on this page
-                (progn
-                  (linear-emacs--log "No issues found on page %d" page-num)
-                  (setq has-more nil))))
+                                   ;; Append issues
+                                   (setq all-issues (append all-issues page-issues))
+                                   (setq total-fetched (length all-issues))
 
-          ;; Error occurred
-          (progn
-            (linear-emacs--log "Error fetching page %d" page-num)
-            (setq has-more nil)))))
+                                   ;; Update progress
+                                   (linear-emacs--progress
+                                    "Retrieved %d issues%s..."
+                                    total-fetched
+                                    (if has-more
+                                        (format " (fetching page %d)" (1+ page-num))
+                                      ""))
 
-    (when (>= page-num max-pages)
-      (linear-emacs--log "Reached maximum page limit (%d pages)" max-pages))
+                                   ;; Continue or finish
+                                   (if has-more
+                                       (progn
+                                         (setq page-num (1+ page-num))
+                                         (fetch-next-page next-cursor))
+                                     (progn
+                                       (linear-emacs--progress "Retrieved %d issues (complete)" total-fetched)
+                                       (setq linear-emacs--cache-issues all-issues)
+                                       (funcall callback all-issues))))
 
-    ;; Return the aggregated issues
-    (linear-emacs--log "Retrieved a total of %d issues across %d pages" (length all-issues) (1- page-num))
-    (setq linear-emacs--cache-issues all-issues)
-    all-issues))
+                               ;; No issues on this page
+                               (progn
+                                 (linear-emacs--log "No issues found on page %d" page-num)
+                                 (linear-emacs--progress "Retrieved %d issues (complete)" total-fetched)
+                                 (setq linear-emacs--cache-issues all-issues)
+                                 (funcall callback all-issues))))
 
-(defun linear-emacs-create-issue (title description team-id)
-  "Create a new issue with TITLE, DESCRIPTION, and TEAM-ID."
+                         ;; Error occurred
+                         (progn
+                           (linear-emacs--log "Error fetching page %d" page-num)
+                           (message "Error fetching issues, returning %d issues fetched so far" total-fetched)
+                           (setq linear-emacs--cache-issues all-issues)
+                           (funcall callback all-issues))))
+                     cursor project-id))))
+
+      ;; Start fetching from the first page
+      (fetch-next-page nil))))
+
+(defun linear-emacs-get-issues (&optional project-id)
+  "Get all issues (synchronous wrapper for backward compatibility).
+PROJECT-ID optionally filters by project."
+  (let ((issues nil)
+        (completed nil))
+
+    (linear-emacs-get-issues-async
+     (lambda (result)
+       (setq issues result)
+       (setq completed t))
+     project-id)
+
+    ;; Wait for completion
+    (while (not completed)
+      (sleep-for 0.1))
+
+    issues))
+
+(defun linear-emacs-create-issue-async (title description team-id callback)
+  "Asynchronously create a new issue.
+TITLE is the issue title.
+DESCRIPTION is the issue description.
+TEAM-ID is the team to create the issue in.
+CALLBACK is called with the created issue data."
   (linear-emacs--log "Creating issue: %s" title)
+  (linear-emacs--progress "Creating issue...")
+
   (let* ((query "mutation CreateIssue($title: String!, $description: String, $teamId: String!) {
   issueCreate(input: {title: $title, description: $description, teamId: $teamId}) {
   success
@@ -469,21 +542,53 @@ Optionally filter by PROJECT-ID."
          (variables `(("title" . ,title)
                       ("description" . ,description)
                       ("teamId" . ,team-id)))
-         (response (linear-emacs--graphql-request query variables)))
-    (if response
-        (let ((issue-data (assoc 'issue (assoc 'issueCreate (assoc 'data response)))))
-          (message "Created issue %s: %s"
-                   (cdr (assoc 'identifier issue-data))
-                   (cdr (assoc 'title issue-data)))
-          issue-data)
-      (message "Failed to create issue")
-      nil)))
 
-;;; Issue State Management
+         (success-fn (lambda (response)
+                       (if response
+                           (let ((issue-data (assoc 'issue (assoc 'issueCreate (assoc 'data response)))))
+                             (message "Created issue %s: %s"
+                                      (cdr (assoc 'identifier issue-data))
+                                      (cdr (assoc 'title issue-data)))
+                             (when callback
+                               (funcall callback issue-data)))
+                         (message "Failed to create issue")
+                         (when callback
+                           (funcall callback nil)))))
 
-(defun linear-emacs-get-states (team-id)
-  "Get workflow states for the given TEAM-ID."
+         (error-fn (lambda (_error _response _data)
+                     (message "Failed to create issue")
+                     (when callback
+                       (funcall callback nil)))))
+
+    (linear-emacs--graphql-request-async query variables success-fn error-fn)))
+
+(defun linear-emacs-create-issue (title description team-id)
+  "Create a new issue (synchronous wrapper for backward compatibility).
+TITLE is the issue title.
+DESCRIPTION is the issue description.
+TEAM-ID is the team to create the issue in."
+  (let ((issue nil)
+        (completed nil))
+
+    (linear-emacs-create-issue-async
+     title description team-id
+     (lambda (result)
+       (setq issue result)
+       (setq completed t)))
+
+    ;; Wait for completion
+    (while (not completed)
+      (sleep-for 0.1))
+
+    issue))
+
+;;; Issue State Management (Async)
+
+(defun linear-emacs-get-states-async (team-id callback)
+  "Asynchronously get workflow states for TEAM-ID.
+CALLBACK is called with the list of states."
   (linear-emacs--log "Fetching workflow states for team %s" team-id)
+
   (let* ((query "query GetWorkflowStates($teamId: String!) {
   team(id: $teamId) {
   states {
@@ -496,9 +601,35 @@ Optionally filter by PROJECT-ID."
   }
   }")
          (variables `(("teamId" . ,team-id)))
-         (response (linear-emacs--graphql-request query variables)))
-    (when response
-      (cdr (assoc 'nodes (assoc 'states (assoc 'team (assoc 'data response))))))))
+
+         (success-fn (lambda (response)
+                       (when response
+                         (let ((states (cdr (assoc 'nodes (assoc 'states (assoc 'team (assoc 'data response)))))))
+                           (when callback
+                             (funcall callback states))))))
+
+         (error-fn (lambda (_error _response _data)
+                     (when callback
+                       (funcall callback nil)))))
+
+    (linear-emacs--graphql-request-async query variables success-fn error-fn)))
+
+(defun linear-emacs-get-states (team-id)
+  "Get workflow states for TEAM-ID (synchronous wrapper)."
+  (let ((states nil)
+        (completed nil))
+
+    (linear-emacs-get-states-async
+     team-id
+     (lambda (result)
+       (setq states result)
+       (setq completed t)))
+
+    ;; Wait for completion
+    (while (not completed)
+      (sleep-for 0.1))
+
+    states))
 
 (defun linear-emacs--get-state-id-by-name (state-name team-id)
   "Get the Linear state ID for the given STATE-NAME in TEAM-ID."
@@ -531,6 +662,41 @@ Optionally filter by PROJECT-ID."
         (message "Could not find state with name: %s in team %s" state-name team-id)
         nil))))
 
+(defun linear-emacs--get-team-id-by-name (team-name)
+  "Get the Linear team ID for the given TEAM-NAME."
+  (linear-emacs--log "Looking up team ID for team %s" team-name)
+  (let* ((query "query {
+  teams {
+  nodes {
+  id
+  name
+  }
+  }
+  }")
+         (response (linear-emacs--graphql-request query))
+         (teams (and response
+                     (assoc 'data response)
+                     (assoc 'teams (assoc 'data response))
+                     (cdr (assoc 'nodes (assoc 'teams (assoc 'data response))))))
+         (team (and teams
+                    (seq-find (lambda (tm)
+                                (string= (cdr (assoc 'name tm)) team-name))
+                              teams))))
+    (if team
+        (cdr (assoc 'id team))
+      (progn
+        ;; If we couldn't find the team by exact name, cache the team IDs for debugging
+        (when teams
+          (linear-emacs--log "Available teams: %s"
+                             (mapconcat (lambda (tm)
+                                          (format "%s (%s)"
+                                                  (cdr (assoc 'name tm))
+                                                  (cdr (assoc 'id tm))))
+                                        teams
+                                        ", ")))
+        (message "Could not find team with name: %s" team-name)
+        nil))))
+
 (defun linear-emacs-update-issue-state (issue-id state-name team-id)
   "Update the state of Linear issue with ISSUE-ID to STATE-NAME for TEAM-ID."
   (linear-emacs--log "Updating issue %s state to %s for team %s" issue-id state-name team-id)
@@ -561,37 +727,6 @@ Optionally filter by PROJECT-ID."
             (linear-emacs--log "Failed to update issue state: %s" (prin1-to-string response))
             (message "Failed to update issue %s state" issue-id)))
       (message "Failed to update issue %s state: API error" issue-id))))
-
-(defun linear-emacs--graphql-request-async (query variables success-fn error-fn)
-  "Make an asynchronous GraphQL request to Linear API.
-  QUERY is the GraphQL query string.
-  VARIABLES is an alist of variables to include in the request.
-  SUCCESS-FN is a function to call on successful response.
-  ERROR-FN is a function to call on error."
-  (linear-emacs--log "Making async GraphQL request with query: %s" query)
-  (linear-emacs--log "Variables: %s" (prin1-to-string variables))
-
-  (let ((request-data (json-encode `(("query" . ,query)
-                                     ("variables" . ,variables)))))
-    (linear-emacs--log "Async request payload: %s" request-data)
-
-    (request
-      linear-emacs-graphql-url
-      :type "POST"
-      :headers (linear-emacs--headers)
-      :data request-data
-      :parser 'json-read
-      :success (cl-function
-                (lambda (&key data &allow-other-keys)
-                  (linear-emacs--log "Async response received: %s" (prin1-to-string data))
-                  (funcall success-fn data)))
-      :error (cl-function
-              (lambda (&key error-thrown response data &allow-other-keys)
-                (linear-emacs--log "Async error: %s" error-thrown)
-                (linear-emacs--log "Async response status: %s" (request-response-status-code response))
-                (when data
-                  (linear-emacs--log "Async error response: %s" (prin1-to-string data)))
-                (funcall error-fn error-thrown response data))))))
 
 (defun linear-emacs--update-issue-state-async (issue-id state-name team-id)
   "Asynchronously update the state of Linear issue.
@@ -637,6 +772,74 @@ Optionally filter by PROJECT-ID."
 
       ;; Make the async request
       (linear-emacs--graphql-request-async query variables success-handler error-handler))))
+
+;;; Team Member and Project Management
+
+(defun linear-emacs-get-team-members (team-id)
+  "Get members for the given TEAM-ID."
+  (linear-emacs--log "Fetching team members for team %s" team-id)
+  (let* ((query "query GetTeamMembers($teamId: String!) {
+  team(id: $teamId) {
+  members {
+  nodes {
+  id
+  name
+  displayName
+  }
+  }
+  }
+  }")
+         (variables `(("teamId" . ,team-id)))
+         (response (linear-emacs--graphql-request query variables)))
+    (when response
+      (let ((members (cdr (assoc 'nodes (assoc 'members (assoc 'team (assoc 'data response)))))))
+        (linear-emacs--log "Retrieved %d team members" (length members))
+        (let ((formatted-members
+               (mapcar (lambda (member)
+                         (cons (or (cdr (assoc 'displayName member))
+                                   (cdr (assoc 'name member)))
+                               (cdr (assoc 'id member))))
+                       members)))
+          (linear-emacs--log "Formatted team members: %s" (prin1-to-string formatted-members))
+          formatted-members)))))
+
+(defun linear-emacs-get-projects (team-id)
+  "Get a list of projects for the given TEAM-ID."
+  (linear-emacs--log "Fetching projects for team %s" team-id)
+  (let* ((query "query GetProjects($teamId: String!) {
+  team(id: $teamId) {
+    projects {
+      nodes {
+        id
+        name
+        description
+        state
+      }
+    }
+  }
+}")
+         (variables `(("teamId" . ,team-id)))
+         (response (linear-emacs--graphql-request query variables)))
+    (when response
+      (let ((projects (cdr (assoc 'nodes (assoc 'projects (assoc 'team (assoc 'data response)))))))
+        ;; Convert vector to list if needed
+        (when (vectorp projects)
+          (setq projects (append projects nil)))
+        (linear-emacs--log "Retrieved %d projects" (length projects))
+        projects))))
+
+(defun linear-emacs-select-project (team-id)
+  "Prompt user to select a project from TEAM-ID."
+  (let* ((projects (linear-emacs-get-projects team-id))
+         (project-names (when projects
+                          (mapcar (lambda (project)
+                                    (cons (cdr (assoc 'name project)) project))
+                                  projects)))
+         (selected (when project-names
+                     (completing-read "Select project (optional): "
+                                      (cons "None" project-names) nil t nil nil "None"))))
+    (unless (string= selected "None")
+      (cdr (assoc selected project-names)))))
 
 ;;; Other Issue Attributes
 
@@ -690,11 +893,11 @@ Optionally filter by PROJECT-ID."
         (team-id nil)
         ;; Get regex pattern for TODO states
         (todo-states-pattern (linear-emacs--get-todo-states-pattern)))
-    
+
     ;; Extract TODO state
     (when (looking-at (format "^\\*\\*\\* \\(%s\\)" todo-states-pattern))
       (setq todo-state (match-string 1))
-      
+
       ;; Get issue ID, identifier, and team ID from properties
       (save-excursion
         (forward-line)
@@ -713,7 +916,7 @@ Optionally filter by PROJECT-ID."
               (let ((team-name (match-string 1)))
                 (setq team-id (linear-emacs--get-team-id-by-name team-name)))))
             (forward-line)))))
-    
+
     ;; Return properties as plist
     (list :todo-state todo-state
           :issue-id issue-id
@@ -728,7 +931,7 @@ Optionally filter by PROJECT-ID."
          (issue-id (plist-get props :issue-id))
          (issue-identifier (plist-get props :issue-identifier))
          (team-id (plist-get props :team-id)))
-    
+
     ;; If we found an issue ID, state, and team ID, update the Linear API
     (when (and issue-id issue-identifier team-id)
       ;; Map org TODO state to Linear state
@@ -872,80 +1075,89 @@ Optionally filter by PROJECT-ID."
 
     result))
 
-;;; User-facing Commands
+;;; User-facing Commands (Async)
 
 ;;;###autoload
 (defun linear-emacs-list-issues (&optional project-id)
   "Update linear.org file with assigned Linear issues and display it.
-  Only shows issues with statuses TODO, IN-PROGRESS, IN-REVIEW, BACKLOG, and BLOCKED.
-  Optionally filter by PROJECT-ID."
+Only shows issues with statuses TODO, IN-PROGRESS, IN-REVIEW, BACKLOG, and BLOCKED.
+Optionally filter by PROJECT-ID.
+This is now async and shows progress during fetching."
   (interactive)
   (linear-emacs--log "Executing linear-emacs-list-issues")
-  (let* ((issues (linear-emacs-get-issues project-id))
-         (org-file-path linear-emacs-org-file-path)
-         ;; Define the list of statuses to include (case insensitive)
-         (include-statuses (linear-emacs--get-included-linear-states)))
-    (linear-emacs--log "Retrieved %d total issues before filtering" (length issues))
-    (if (and issues (> (length issues) 0))
-        (progn
-          ;; Make sure issues is a list, not a vector
-          (when (vectorp issues)
-            (setq issues (append issues nil)))
 
-          ;; Filter issues based on status
-          (setq issues
-                (seq-filter
-                 (lambda (issue)
-                   (let* ((state-assoc (assoc 'state issue))
-                          (state (and state-assoc (cdr (assoc 'name state-assoc))))
-                          (state-lower (and state (downcase state))))
-                     (linear-emacs--log "Issue %s has state: %s (include: %s)"
-                                        (cdr (assoc 'identifier issue))
-                                        state-lower
-                                        (if (member state-lower include-statuses) "yes" "no"))
-                     (member state-lower include-statuses)))
-                 issues))
+  (linear-emacs--progress "Fetching issues from Linear...")
 
-          (linear-emacs--log "After filtering by status, have %d issues" (length issues))
+  (linear-emacs-get-issues-async
+   (lambda (issues)
+     (let* ((org-file-path linear-emacs-org-file-path)
+            (include-statuses (linear-emacs--get-included-linear-states)))
 
-          ;; Update org file
-          (condition-case err
-              (progn
-                (with-temp-buffer
-                  ;; Insert header
-                  (insert ":PROPERTIES:\n")
-                  (insert ":ID:       a12acb12-8a69-4d15-a846-21e20ed2f3ae\n")
-                  (insert "#+title: Linear issues assigned to me\n")
-                  (insert "#+TAGS: :\n")
-                  (insert "#+filetags: :twai:b:\n")
-                  (insert "#+STARTUP: overview\n")
-                  (insert "#+TODO: TODO IN-PROGRESS IN-REVIEW BACKLOG BLOCKED | DONE\n")
-                  (insert ":END:\n\n")
+       (linear-emacs--log "Retrieved %d total issues before filtering" (length issues))
 
-                  ;; Insert issues
-                  (dolist (issue issues)
-                    (insert (linear-emacs--format-issue-as-org-entry issue)))
+       (if (and issues (> (length issues) 0))
+           (progn
+             ;; Make sure issues is a list, not a vector
+             (when (vectorp issues)
+               (setq issues (append issues nil)))
 
-                  ;; Write to file
-                  (linear-emacs--log "Writing %d issues to %s" (length issues) org-file-path)
-                  (make-directory (file-name-directory org-file-path) t) ;; Ensure directory exists
-                  (write-region (point-min) (point-max) org-file-path nil 'quiet))
+             ;; Filter issues based on status
+             (setq issues
+                   (seq-filter
+                    (lambda (issue)
+                      (let* ((state-assoc (assoc 'state issue))
+                             (state (and state-assoc (cdr (assoc 'name state-assoc))))
+                             (state-lower (and state (downcase state))))
+                        (linear-emacs--log "Issue %s has state: %s (include: %s)"
+                                           (cdr (assoc 'identifier issue))
+                                           state-lower
+                                           (if (member state-lower include-statuses) "yes" "no"))
+                        (member state-lower include-statuses)))
+                    issues))
 
-                ;; Open the org file
-                (find-file org-file-path)
-                (message "Updated Linear issues in %s with %d active issues"
-                         org-file-path (length issues)))
+             (linear-emacs--log "After filtering by status, have %d issues" (length issues))
+             (linear-emacs--progress "Writing %d issues to org file..." (length issues))
 
-            ;; Handle errors
-            (error (progn
-                     (linear-emacs--log "Error updating linear.org: %s" (error-message-string err))
-                     (message "Error updating linear.org: %s" (error-message-string err))))))
+             ;; Update org file
+             (condition-case err
+                 (progn
+                   (with-temp-buffer
+                     ;; Insert header
+                     (insert ":PROPERTIES:\n")
+                     (insert ":ID:       a12acb12-8a69-4d15-a846-21e20ed2f3ae\n")
+                     (insert "#+title: Linear issues assigned to me\n")
+                     (insert "#+TAGS: :\n")
+                     (insert "#+filetags: :twai:b:\n")
+                     (insert "#+STARTUP: overview\n")
+                     (insert "#+TODO: TODO IN-PROGRESS IN-REVIEW BACKLOG BLOCKED | DONE\n")
+                     (insert ":END:\n\n")
 
-      (message "No issues found or failed to retrieve issues"))))
+                     ;; Insert issues
+                     (dolist (issue issues)
+                       (insert (linear-emacs--format-issue-as-org-entry issue)))
+
+                     ;; Write to file
+                     (linear-emacs--log "Writing %d issues to %s" (length issues) org-file-path)
+                     (make-directory (file-name-directory org-file-path) t) ;; Ensure directory exists
+                     (write-region (point-min) (point-max) org-file-path nil 'quiet))
+
+                   ;; Open the org file
+                   (find-file org-file-path)
+                   (message "Updated Linear issues in %s with %d active issues"
+                            org-file-path (length issues)))
+
+               ;; Handle errors
+               (error (progn
+                        (linear-emacs--log "Error updating linear.org: %s" (error-message-string err))
+                        (message "Error updating linear.org: %s" (error-message-string err))))))
+
+         (message "No issues found or failed to retrieve issues"))))
+   project-id))
 
 ;;;###autoload
 (defun linear-emacs-list-issues-by-project ()
-  "List Linear issues filtered by a selected project."
+  "List Linear issues filtered by a selected project.
+Uses async API for better performance."
   (interactive)
   ;; First select team
   (let* ((team (if linear-emacs-default-team-id
@@ -1095,14 +1307,19 @@ Optionally filter by PROJECT-ID."
   "Test the connection to Linear API."
   (interactive)
   (linear-emacs--log "Testing connection to Linear API")
-  (let* ((query "query { viewer { id name } }")
-         (response (linear-emacs--graphql-request query)))
-    (if response
-        (let ((viewer (assoc 'viewer (assoc 'data response))))
-          (message "Connected to Linear as: %s" (cdr (assoc 'name viewer)))
-          t)
-      (message "Failed to connect to Linear API")
-      nil)))
+  (linear-emacs--progress "Testing Linear API connection...")
+
+  (let* ((query "query { viewer { id name } }"))
+    (linear-emacs--graphql-request-async
+     query
+     nil
+     (lambda (response)
+       (if response
+           (let ((viewer (assoc 'viewer (assoc 'data response))))
+             (message "Connected to Linear as: %s" (cdr (assoc 'name viewer))))
+         (message "Failed to connect to Linear API")))
+     (lambda (_error _response _data)
+       (message "Failed to connect to Linear API")))))
 
 ;;;###autoload
 (defun linear-emacs-toggle-debug ()
